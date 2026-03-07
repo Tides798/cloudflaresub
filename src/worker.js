@@ -1,142 +1,441 @@
-import {
-  buildShareUrls,
-  decryptPayload,
-  detectTarget,
-  encryptPayload,
-  ensureSecret,
-  expandNodes,
-  parseNodeLinks,
-  parsePreferredEndpoints,
-  renderSubscription,
-  summarizeNodes,
-} from './core.js';
-
-const JSON_HEADERS = {
-  'content-type': 'application/json; charset=utf-8',
-  'cache-control': 'no-store',
-};
-
-export default {
-  async fetch(request, env) {
-    try {
-      return await routeRequest(request, env);
-    } catch (error) {
-      const status = Number.isInteger(error?.status) ? error.status : 400;
-      return json(
-        {
-          ok: false,
-          error: error?.message || '请求处理失败。',
-        },
-        status,
-      );
-    }
-  },
-};
-
-async function routeRequest(request, env) {
-  const url = new URL(request.url);
-  const { pathname } = url;
-
-  if (request.method === 'GET' && pathname === '/api/health') {
-    return json({ ok: true, status: 'ok' });
-  }
-
-  if (request.method === 'POST' && pathname === '/api/generate') {
-    return handleGenerate(request, env, url);
-  }
-
-  if (request.method === 'GET' && pathname.startsWith('/sub/')) {
-    return handleSubscription(request, env, url);
-  }
-
-  if (env.ASSETS) {
-    return env.ASSETS.fetch(request);
-  }
-
-  return new Response('Not Found', { status: 404 });
-}
-
-async function handleGenerate(request, env, url) {
-  const secret = ensureSecret(env.SUB_LINK_SECRET);
-  const body = await request.json();
-  const nodeLinks = String(body?.nodeLinks || '');
-  const preferredIps = String(body?.preferredIps || '');
-  const keepOriginalHost = body?.keepOriginalHost !== false;
-  const namePrefix = String(body?.namePrefix || '').trim();
-
-  const parsedNodes = parseNodeLinks(nodeLinks);
-  const parsedEndpoints = parsePreferredEndpoints(preferredIps);
-  const expanded = expandNodes(parsedNodes.nodes, parsedEndpoints.endpoints, {
-    keepOriginalHost,
-    namePrefix,
-  });
-
-  const payload = {
-    version: 1,
-    keepOriginalHost,
-    namePrefix,
-    createdAt: new Date().toISOString(),
-    nodes: expanded.nodes,
-  };
-
-  const token = await encryptPayload(payload, secret);
-  const origin = url.origin;
-  const urls = buildShareUrls(origin, token);
-
-  const capabilities = {
-    raw: expanded.nodes.length > 0,
-    clash: expanded.nodes.length > 0,
-    surge: expanded.nodes.some((node) => node.type === 'vmess' || node.type === 'trojan'),
-  };
-
-  return json({
-    ok: true,
-    token,
-    urls,
-    counts: {
-      inputNodes: parsedNodes.nodes.length,
-      preferredEndpoints: parsedEndpoints.endpoints.length,
-      outputNodes: expanded.nodes.length,
-    },
-    capabilities,
-    preview: summarizeNodes(expanded.nodes, 20),
-    warnings: [
-      ...parsedNodes.warnings,
-      ...parsedEndpoints.warnings,
-      ...expanded.warnings,
-    ],
-  });
-}
-
-async function handleSubscription(request, env, url) {
-  const secret = ensureSecret(env.SUB_LINK_SECRET);
-  const token = url.pathname.split('/').filter(Boolean)[1];
-  if (!token) {
-    throw new Error('缺少订阅令牌。');
-  }
-
-  const payload = await decryptPayload(token, secret);
-  if (!payload?.nodes?.length) {
-    throw new Error('订阅内容为空。');
-  }
-
-  const target = detectTarget(request.headers.get('user-agent'), url.searchParams.get('target') || url.searchParams.get('format'));
-  const rendered = renderSubscription(target, payload.nodes, request.url);
-
-  return new Response(rendered.body, {
-    status: 200,
-    headers: {
-      'content-type': rendered.contentType,
-      'cache-control': 'no-store',
-      'content-disposition': `inline; filename*=UTF-8''${encodeURIComponent(rendered.filename)}`,
-      'x-subscription-target': target,
-    },
-  });
-}
+// Cloudflare Worker: KV short link subscription + access token protection
+// Requires:
+// - KV namespace binding: SUB_STORE
+// - Secret/Variable: SUB_ACCESS_TOKEN
+// Optional:
+// - Secret/Variable: SUB_LINK_SECRET (legacy long-token compatibility)
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: JSON_HEADERS,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET,POST,OPTIONS',
+      'access-control-allow-headers': 'content-type',
+    },
   });
 }
+
+function text(body, status = 200, contentType = 'text/plain; charset=utf-8') {
+  return new Response(body, {
+    status,
+    headers: {
+      'content-type': contentType,
+      'access-control-allow-origin': '*',
+    },
+  });
+}
+
+function b64EncodeUtf8(str) {
+  return btoa(unescape(encodeURIComponent(str)));
+}
+
+function b64DecodeUtf8(str) {
+  return decodeURIComponent(escape(atob(str)));
+}
+
+function escapeYaml(str = '') {
+  return String(str)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, ' ');
+}
+
+function parsePreferredEndpoints(input) {
+  return String(input || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [raw, remark = ''] = line.split('#');
+      const value = raw.trim();
+      const hashRemark = remark.trim();
+      const match = value.match(/^(.*?)(?::(\d+))?$/);
+      return {
+        server: match?.[1] || value,
+        port: match?.[2] ? Number(match[2]) : undefined,
+        remark: hashRemark,
+      };
+    });
+}
+
+function parseVmess(link) {
+  const raw = link.slice('vmess://'.length).trim();
+  const obj = JSON.parse(b64DecodeUtf8(raw));
+  return {
+    type: 'vmess',
+    name: obj.ps || 'vmess',
+    server: obj.add,
+    port: Number(obj.port || 443),
+    uuid: obj.id,
+    cipher: obj.scy || 'auto',
+    network: obj.net || 'ws',
+    tls: obj.tls === 'tls',
+    host: obj.host || '',
+    path: obj.path || '/',
+    sni: obj.sni || obj.host || '',
+    alpn: obj.alpn || '',
+    fp: obj.fp || '',
+  };
+}
+
+function parseUrlLike(link, type) {
+  const u = new URL(link);
+  return {
+    type,
+    name: decodeURIComponent(u.hash.replace(/^#/, '')) || type,
+    server: u.hostname,
+    port: Number(u.port || 443),
+    password: type === 'trojan' ? decodeURIComponent(u.username) : undefined,
+    uuid: type === 'vless' ? decodeURIComponent(u.username) : undefined,
+    network: u.searchParams.get('type') || 'tcp',
+    tls: (u.searchParams.get('security') || '').toLowerCase() === 'tls',
+    host: u.searchParams.get('host') || u.searchParams.get('sni') || '',
+    path: u.searchParams.get('path') || '/',
+    sni: u.searchParams.get('sni') || u.searchParams.get('host') || '',
+    fp: u.searchParams.get('fp') || '',
+    alpn: u.searchParams.get('alpn') || '',
+    flow: u.searchParams.get('flow') || '',
+  };
+}
+
+function parseRawLinks(input) {
+  const lines = String(input || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const result = [];
+  for (const line of lines) {
+    if (line.startsWith('vmess://')) {
+      result.push(parseVmess(line));
+      continue;
+    }
+    if (line.startsWith('vless://')) {
+      result.push(parseUrlLike(line, 'vless'));
+      continue;
+    }
+    if (line.startsWith('trojan://')) {
+      result.push(parseUrlLike(line, 'trojan'));
+      continue;
+    }
+    // Try decode base64 subscription containing multiple lines.
+    try {
+      const decoded = b64DecodeUtf8(line);
+      if (/^(vmess|vless|trojan):\/\//m.test(decoded)) {
+        result.push(...parseRawLinks(decoded));
+      }
+    } catch {}
+  }
+  return result;
+}
+
+function buildNodes(baseNodes, preferredEndpoints, options = {}) {
+  const output = [];
+  const prefix = (options.namePrefix || '').trim();
+  let counter = 0;
+  for (const node of baseNodes) {
+    for (const ep of preferredEndpoints) {
+      counter += 1;
+      const nameParts = [];
+      if (node.name) nameParts.push(node.name);
+      if (prefix) nameParts.push(prefix);
+      if (ep.remark) nameParts.push(ep.remark);
+      else nameParts.push(String(counter));
+      output.push({
+        ...node,
+        name: nameParts.join(' | '),
+        server: ep.server,
+        port: ep.port || node.port,
+        host: options.keepOriginalHost ? node.host : '',
+        sni: options.keepOriginalHost ? node.sni : '',
+      });
+    }
+  }
+  return output;
+}
+
+function encodeVmess(node) {
+  const obj = {
+    v: '2',
+    ps: node.name,
+    add: node.server,
+    port: String(node.port),
+    id: node.uuid,
+    aid: '0',
+    scy: node.cipher || 'auto',
+    net: node.network || 'ws',
+    type: 'none',
+    host: node.host || '',
+    path: node.path || '/',
+    tls: node.tls ? 'tls' : '',
+    sni: node.sni || '',
+    alpn: node.alpn || '',
+    fp: node.fp || '',
+  };
+  return 'vmess://' + b64EncodeUtf8(JSON.stringify(obj));
+}
+
+function encodeVless(node) {
+  const url = new URL(`vless://${encodeURIComponent(node.uuid)}@${node.server}:${node.port}`);
+  url.searchParams.set('type', node.network || 'ws');
+  if (node.tls) url.searchParams.set('security', 'tls');
+  if (node.host) url.searchParams.set('host', node.host);
+  if (node.sni) url.searchParams.set('sni', node.sni);
+  if (node.path) url.searchParams.set('path', node.path);
+  if (node.alpn) url.searchParams.set('alpn', node.alpn);
+  if (node.fp) url.searchParams.set('fp', node.fp);
+  if (node.flow) url.searchParams.set('flow', node.flow);
+  url.hash = node.name;
+  return url.toString();
+}
+
+function encodeTrojan(node) {
+  const url = new URL(`trojan://${encodeURIComponent(node.password)}@${node.server}:${node.port}`);
+  if (node.network) url.searchParams.set('type', node.network);
+  if (node.tls) url.searchParams.set('security', 'tls');
+  if (node.host) url.searchParams.set('host', node.host);
+  if (node.sni) url.searchParams.set('sni', node.sni);
+  if (node.path) url.searchParams.set('path', node.path);
+  if (node.alpn) url.searchParams.set('alpn', node.alpn);
+  if (node.fp) url.searchParams.set('fp', node.fp);
+  url.hash = node.name;
+  return url.toString();
+}
+
+function renderRaw(nodes) {
+  const lines = nodes.map((node) => {
+    if (node.type === 'vmess') return encodeVmess(node);
+    if (node.type === 'vless') return encodeVless(node);
+    if (node.type === 'trojan') return encodeTrojan(node);
+    return '';
+  }).filter(Boolean);
+  return b64EncodeUtf8(lines.join('\n'));
+}
+
+function renderClash(nodes) {
+  const proxies = nodes.map((node) => {
+    if (node.type === 'vmess') {
+      return [
+        `  - name: "${escapeYaml(node.name)}"`,
+        `    type: vmess`,
+        `    server: ${node.server}`,
+        `    port: ${node.port}`,
+        `    uuid: ${node.uuid}`,
+        `    alterId: 0`,
+        `    cipher: ${node.cipher || 'auto'}`,
+        `    tls: ${node.tls ? 'true' : 'false'}`,
+        `    network: ${node.network || 'ws'}`,
+        `    servername: "${escapeYaml(node.sni || '')}"`,
+        `    ws-opts:`,
+        `      path: "${escapeYaml(node.path || '/')}"`,
+        `      headers:`,
+        `        Host: "${escapeYaml(node.host || '')}"`,
+      ].join('\n');
+    }
+    if (node.type === 'vless') {
+      return [
+        `  - name: "${escapeYaml(node.name)}"`,
+        `    type: vless`,
+        `    server: ${node.server}`,
+        `    port: ${node.port}`,
+        `    uuid: ${node.uuid}`,
+        `    tls: ${node.tls ? 'true' : 'false'}`,
+        `    network: ${node.network || 'ws'}`,
+        `    servername: "${escapeYaml(node.sni || '')}"`,
+        `    ws-opts:`,
+        `      path: "${escapeYaml(node.path || '/')}"`,
+        `      headers:`,
+        `        Host: "${escapeYaml(node.host || '')}"`,
+      ].join('\n');
+    }
+    if (node.type === 'trojan') {
+      return [
+        `  - name: "${escapeYaml(node.name)}"`,
+        `    type: trojan`,
+        `    server: ${node.server}`,
+        `    port: ${node.port}`,
+        `    password: "${escapeYaml(node.password || '')}"`,
+        `    sni: "${escapeYaml(node.sni || '')}"`,
+        `    network: ${node.network || 'ws'}`,
+        `    ws-opts:`,
+        `      path: "${escapeYaml(node.path || '/')}"`,
+        `      headers:`,
+        `        Host: "${escapeYaml(node.host || '')}"`,
+      ].join('\n');
+    }
+    return '';
+  }).filter(Boolean);
+
+  return [
+    'proxies:',
+    ...proxies,
+  ].join('\n');
+}
+
+function renderSurge(nodes, baseUrl, accessToken) {
+  const proxies = nodes
+    .filter((node) => node.type === 'vmess' || node.type === 'trojan')
+    .map((node) => {
+      if (node.type === 'vmess') {
+        return `${node.name} = vmess, ${node.server}, ${node.port}, username=${node.uuid}, ws=true, ws-path=${node.path || '/'}, ws-headers=Host:${node.host || ''}, tls=${node.tls ? 'true' : 'false'}, sni=${node.sni || ''}`;
+      }
+      return `${node.name} = trojan, ${node.server}, ${node.port}, password=${node.password || ''}, sni=${node.sni || ''}`;
+    });
+  return [
+    '[General]',
+    'skip-proxy = 127.0.0.1, localhost',
+    '',
+    '[Proxy]',
+    ...proxies,
+    '',
+    '[Proxy Group]',
+    'Proxy = select, ' + nodes.filter((n) => n.type === 'vmess' || n.type === 'trojan').map((n) => n.name).join(', '),
+    '',
+    '[Rule]',
+    'FINAL,Proxy',
+    '',
+    '; token-protected subscription',
+    `; ${baseUrl}?token=${accessToken}`,
+  ].join('\n');
+}
+
+function createShortId(length = 10) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  let out = '';
+  for (let i = 0; i < length; i++) {
+    out += chars[bytes[i] % chars.length];
+  }
+  return out;
+}
+
+async function createUniqueShortId(env, tries = 5) {
+  for (let i = 0; i < tries; i++) {
+    const id = createShortId(10);
+    const exists = await env.SUB_STORE.get(id);
+    if (!exists) return id;
+  }
+  throw new Error('无法生成唯一短链接，请稍后再试');
+}
+
+async function handleGenerate(request, env, url) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: '请求体不是合法 JSON' }, 400);
+  }
+
+  const baseNodes = parseRawLinks(body.nodeLinks || '');
+  const preferredEndpoints = parsePreferredEndpoints(body.preferredIps || '');
+
+  if (!baseNodes.length) return json({ ok: false, error: '没有识别到可用节点' }, 400);
+  if (!preferredEndpoints.length) return json({ ok: false, error: '没有识别到可用优选地址' }, 400);
+
+  const nodes = buildNodes(baseNodes, preferredEndpoints, {
+    namePrefix: body.namePrefix || '',
+    keepOriginalHost: body.keepOriginalHost !== false,
+  });
+
+  const id = await createUniqueShortId(env);
+  const payload = {
+    version: 1,
+    createdAt: new Date().toISOString(),
+    options: {
+      namePrefix: body.namePrefix || '',
+      keepOriginalHost: body.keepOriginalHost !== false,
+    },
+    nodes,
+  };
+  await env.SUB_STORE.put(id, JSON.stringify(payload));
+
+  const origin = url.origin;
+  const accessToken = env.SUB_ACCESS_TOKEN || '';
+  const withToken = (target) => `${origin}/sub/${id}${target ? `?target=${target}&token=${encodeURIComponent(accessToken)}` : `?token=${encodeURIComponent(accessToken)}`}`;
+
+  return json({
+    ok: true,
+    storage: 'kv',
+    shortId: id,
+    urls: {
+      auto: withToken(''),
+      raw: withToken('raw'),
+      clash: withToken('clash'),
+      surge: withToken('surge'),
+    },
+    counts: {
+      inputNodes: baseNodes.length,
+      preferredEndpoints: preferredEndpoints.length,
+      outputNodes: nodes.length,
+    },
+    preview: nodes.slice(0, 20).map((node) => ({
+      name: node.name,
+      type: node.type,
+      server: node.server,
+      port: node.port,
+      host: node.host || '',
+      sni: node.sni || '',
+    })),
+    warnings: accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。'],
+  });
+}
+
+function validateAccessToken(url, env) {
+  const expected = env.SUB_ACCESS_TOKEN;
+  if (!expected) return { ok: true };
+  const provided = url.searchParams.get('token') || '';
+  if (!provided || provided !== expected) {
+    return { ok: false, response: text('Forbidden: invalid token', 403) };
+  }
+  return { ok: true };
+}
+
+async function handleSub(url, env) {
+  const tokenCheck = validateAccessToken(url, env);
+  if (!tokenCheck.ok) return tokenCheck.response;
+
+  const id = url.pathname.split('/').pop();
+  if (!id) return text('missing id', 400);
+
+  const raw = await env.SUB_STORE.get(id);
+  if (!raw) return text('not found', 404);
+  const record = JSON.parse(raw);
+  const nodes = record.nodes || [];
+  const target = (url.searchParams.get('target') || 'raw').toLowerCase();
+
+  if (target === 'clash') {
+    return text(renderClash(nodes), 200, 'text/yaml; charset=utf-8');
+  }
+  if (target === 'surge') {
+    return text(renderSurge(nodes, url.origin + url.pathname, env.SUB_ACCESS_TOKEN || ''), 200, 'text/plain; charset=utf-8');
+  }
+  return text(renderRaw(nodes), 200, 'text/plain; charset=utf-8');
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'access-control-allow-origin': '*',
+          'access-control-allow-methods': 'GET,POST,OPTIONS',
+          'access-control-allow-headers': 'content-type',
+        },
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/generate') {
+      return handleGenerate(request, env, url);
+    }
+
+    if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
+      return handleSub(url, env);
+    }
+
+    return env.ASSETS.fetch(request);
+  },
+};
